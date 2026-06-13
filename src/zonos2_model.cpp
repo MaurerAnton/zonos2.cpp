@@ -1,5 +1,6 @@
 // zonos2_model.cpp — Pure C++ Zonos2 model implementation using ggml
 // Corrected: per-token RMSNorm, QK norm, KV cache, GQA attention, EDA router
+// BF16 emulation: rounds F32 to BF16 precision to match Python's BF16 behavior
 
 #include "zonos2.h"
 #include <ggml.h>
@@ -8,6 +9,35 @@
 #include <cstdio>
 #include <algorithm>
 
+// ============================================================
+// BF16 emulation (matches Python's bfloat16 precision)
+// ============================================================
+static inline uint16_t f32_to_bf16(float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(float));
+    // BF16 is the upper 16 bits of F32
+    return (uint16_t)(bits >> 16);
+}
+
+static inline float bf16_to_f32(uint16_t bf) {
+    uint32_t bits = ((uint32_t)bf) << 16;
+    float result;
+    memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
+// Round float to BF16 precision (convert to BF16 and back)
+static inline float f32_round_bf16(float f) {
+    return bf16_to_f32(f32_to_bf16(f));
+}
+
+// Round array to BF16 precision in-place
+static void array_round_bf16(float* data, int n) {
+    for (int i = 0; i < n; i++) {
+        data[i] = f32_round_bf16(data[i]);
+    }
+}
+
 static float* tensor_data(ggml_tensor* t) {
     return (float*)((char*)t->data + t->view_offs);
 }
@@ -15,10 +45,9 @@ static float* tensor_data(ggml_tensor* t) {
 // ============================================================
 // RMS Norm: per-token along last dim
 // x: [dim, n_tokens], normalized token-by-token
-// ============================================================
 static void rms_norm_per_token(
     float* x, int dim, int n_tokens, float eps,
-    const float* weight = nullptr  // optional scale weight [dim]
+    const float* weight = nullptr
 ) {
     for (int t = 0; t < n_tokens; t++) {
         float* xt = x + t * dim;
@@ -27,9 +56,9 @@ static void rms_norm_per_token(
         float rms = std::sqrt(ss / dim + eps);
         float rcp = 1.0f / rms;
         if (weight) {
-            for (int d = 0; d < dim; d++) xt[d] = xt[d] * rcp * weight[d];
+            for (int d = 0; d < dim; d++) xt[d] = f32_round_bf16(xt[d] * rcp * weight[d]);
         } else {
-            for (int d = 0; d < dim; d++) xt[d] *= rcp;
+            for (int d = 0; d < dim; d++) xt[d] = f32_round_bf16(xt[d] * rcp);
         }
     }
 }
@@ -205,7 +234,7 @@ static void linear_forward(
             float s = bias ? bias[o] : 0;
             for (int i = 0; i < in_f; i++)
                 s += xt[i] * weight[i + o * in_f];
-            ot[o] = s;
+            ot[o] = f32_round_bf16(s);
         }
     }
 }
@@ -319,7 +348,7 @@ static void attention_forward(
                 scores[s] = std::exp(scores[s] - max_score);
                 sum_exp += scores[s];
             }
-            for (int s = 0; s <= cur_pos; s++) scores[s] /= sum_exp;
+            for (int s = 0; s <= cur_pos; s++) scores[s] = f32_round_bf16(scores[s] / sum_exp);
 
             // Weighted sum of V
             float* out_h = attn_out.data() + hq * head_dim + t * (n_heads * head_dim);
@@ -344,7 +373,7 @@ static void attention_forward(
         linear_forward(attn.gater.weight.ptr(), dim, n_heads, x, n_tokens, gate.data());
         // Sigmoid
         for (int i = 0; i < n_heads * n_tokens; i++)
-            gate[i] = 1.0f / (1.0f + std::exp(-gate[i]));
+            gate[i] = f32_round_bf16(1.0f / (1.0f + std::exp(-gate[i])));
 
         for (int h = 0; h < n_heads; h++) {
             for (int t = 0; t < n_tokens; t++) {
@@ -389,7 +418,7 @@ static void feedforward_forward(
         for (int i = 0; i < ffn_dim; i++) {
             float up_val = h_gate[t * (ffn_dim * 2) + i];
             float gate_val = h_gate[t * (ffn_dim * 2) + ffn_dim + i];
-            y[t * ffn_dim + i] = up_val * silu_f32(gate_val);
+            y[t * ffn_dim + i] = f32_round_bf16(up_val * silu_f32(gate_val));
         }
     }
 
@@ -441,12 +470,12 @@ static void router_forward(
     std::vector<float> tmp1(n_tokens * router_dim);
     linear_forward(router.mlp_0.weight.ptr(), router_dim, router_dim, hs.data(), n_tokens, tmp1.data(),
                    router.mlp_0.bias.empty() ? nullptr : router.mlp_0.bias.ptr());
-    for (int i = 0; i < n_tokens * router_dim; i++) tmp1[i] = gelu_f32(tmp1[i]);
+    for (int i = 0; i < n_tokens * router_dim; i++) tmp1[i] = f32_round_bf16(gelu_f32(tmp1[i]));
 
     std::vector<float> tmp2(n_tokens * router_dim);
     linear_forward(router.mlp_2.weight.ptr(), router_dim, router_dim, tmp1.data(), n_tokens, tmp2.data(),
                    router.mlp_2.bias.empty() ? nullptr : router.mlp_2.bias.ptr());
-    for (int i = 0; i < n_tokens * router_dim; i++) tmp2[i] = gelu_f32(tmp2[i]);
+    for (int i = 0; i < n_tokens * router_dim; i++) tmp2[i] = f32_round_bf16(gelu_f32(tmp2[i]));
 
     // Final linear -> expert logits [n_experts, n_tokens]
     std::vector<float> expert_logits(n_tokens * n_experts);
@@ -542,7 +571,7 @@ static void moe_ffn_forward(
                     g += x[t * dim + i] * gate_row[i];
                     u += x[t * dim + i] * up_row[i];
                 }
-                hidden[o] = g * silu_f32(u);
+                hidden[o] = f32_round_bf16(g * silu_f32(u));
             }
 
             // Down projection
@@ -582,9 +611,16 @@ static void transformer_block_forward(
     attention_forward(layer.attn, cfg, x, n_tokens, start_pos, positions,
                       kv_cache_k, kv_cache_v, attn_out.data());
 
+    // DEBUG: dump attention output during decode layer 0
+    if (layer_id == 0 && n_tokens == 1) {
+        FILE* df = fopen("/tmp/cpp_decode_attn.bin", "wb");
+        fwrite(attn_out.data(), sizeof(float), n_tokens * dim, df);
+        fclose(df);
+    }
+
     // Residual add
     for (int i = 0; i < n_tokens * dim; i++)
-        x[i] = attn_out.data()[i] + residual[i];
+        x[i] = f32_round_bf16(attn_out.data()[i] + residual[i]);
 
     // ffn_norm with fused residual
     // Residual = ORIGINAL x (before normalization)
@@ -603,7 +639,7 @@ static void transformer_block_forward(
 
     // Residual add
     for (int i = 0; i < n_tokens * dim; i++)
-        x[i] = ffn_out.data()[i] + residual[i];
+        x[i] = f32_round_bf16(ffn_out.data()[i] + residual[i]);
 }
 
 // ============================================================
@@ -632,9 +668,18 @@ bool zonos2_forward(
     // 1. Multi-embedding
     std::vector<float> x(n_tokens * dim);
     embedding_sum(w, cfg, input_ids, n_tokens, frame_width, x.data());
+    array_round_bf16(x.data(), n_tokens * dim);  // BF16 rounding
 
     // 2. Embedding norm (elementwise_affine=False → no weight)
     rms_norm_per_token(x.data(), dim, n_tokens, cfg.norm_eps);
+
+    // DEBUG: save post-embedding hidden
+    {
+        const char* fname = (n_tokens > 1) ? "/tmp/cpp_emb_prefill.bin" : "/tmp/cpp_emb_decode.bin";
+        FILE* df = fopen(fname, "wb");
+        fwrite(x.data(), sizeof(float), n_tokens * dim, df);
+        fclose(df);
+    }
 
     // 3. Transformer layers
     std::vector<float> residual(n_tokens * dim);
@@ -664,12 +709,33 @@ bool zonos2_forward(
             layer, cfg, x.data(), n_tokens, start_pos, positions.data(),
             kc, vc, residual.data(), rs_in, rs_out, layer_id
         );
+
+        // DEBUG: dump hidden after layer 0 during decode
+        if (layer_id == 0 && n_tokens == 1) {
+            FILE* df = fopen("/tmp/cpp_decode_l0.bin", "wb");
+            fwrite(x.data(), sizeof(float), n_tokens * dim, df);
+            fclose(df);
+        }
+    }
+
+    // DEBUG: dump KV cache after all layers (prefill only)
+    if (n_tokens > 1) {
+        FILE* df = fopen("/tmp/cpp_kvcache.bin", "wb");
+        fwrite(state.kv_cache.data(), sizeof(float), state.kv_cache.size(), df);
+        fclose(df);
     }
 
     // 4. Output norm (with fused residual from last layer)
     // x already contains the residual-add result, apply out_norm
     rms_norm_per_token(x.data(), dim, n_tokens, cfg.norm_eps,
                        w.out_norm.has_weight ? w.out_norm.weight.ptr() : nullptr);
+
+    // DEBUG: save hidden states
+    if (n_tokens > 1) {
+        FILE* df = fopen("/tmp/cpp_hidden.bin", "wb");
+        fwrite(x.data(), sizeof(float), n_tokens * dim, df);
+        fclose(df);
+    }
 
     // 5. Multi-output head
     int out_dim = audio_vocab * n_codebooks;
@@ -689,9 +755,10 @@ bool zonos2_forward(
         }
     }
 
-    // DEBUG: save logits
+    // DEBUG: save logits for comparison
     {
-        FILE* df = fopen("/tmp/cpp_logits.bin", "wb");
+        const char* fname = (n_tokens > 1) ? "/tmp/cpp_prefill_logits.bin" : "/tmp/cpp_decode_logits.bin";
+        FILE* df = fopen(fname, "wb");
         fwrite(logits_out, sizeof(float), n_tokens * n_codebooks * audio_vocab, df);
         fclose(df);
     }

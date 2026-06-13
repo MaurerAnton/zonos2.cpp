@@ -143,9 +143,8 @@ int main(int argc, char** argv) {
     // Python: shear(silence_tensor, audio_pad_id) → [17, 9]
     for (int i = 0; i < silence_frames; i++) {
         for (int cb = 0; cb < n_codebooks; cb++) {
-            // shear: row_idx = (C-1) + arange(T) - arange(C)
-            // Simplified: column cb gets source row i - ((n_codebooks-1) - cb)
-            int src = i - (n_codebooks - 1 - cb);
+            // shear: result[t][c] = SIL[t-c][c] if t-c >= 0, else pad
+            int src = i - cb;
             if (src >= 0 && src < silence_frames)
                 prompt[pf * frame_width + cb] = silence_tokens[src][cb];
             else
