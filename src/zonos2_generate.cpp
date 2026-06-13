@@ -4,11 +4,8 @@
 #include <cmath>
 #include <cstring>
 #include <cstdio>
-#include <cstdlib>
-#include <sys/stat.h>
-#include <random>
-#include <algorithm>
 #include <vector>
+#include <algorithm>
 
 // Xoshiro256** PRNG
 struct Xoshiro256 {
@@ -254,7 +251,7 @@ bool zonos2_generate(
 }
 
 // ============================================================
-// DAC decoder bridge (calls external Python DAC)
+// DAC codec token save (audio decode requires external DAC)
 // ============================================================
 
 bool decode_dac_to_wav(
@@ -264,14 +261,12 @@ bool decode_dac_to_wav(
     int n_frames = (int)codes.size();
     int n_codebooks = codes.empty() ? 0 : (int)codes[0].size();
 
-    if (n_frames == 0) {
-        fprintf(stderr, "No audio frames to decode\n");
-        return false;
-    }
+    if (n_frames == 0) return false;
 
-    // Write codes to temp binary
-    std::string tmp = output_path + ".codes.bin";
-    FILE* f = fopen(tmp.c_str(), "wb");
+    // Save raw DAC codes — decode externally with:
+    //   python3.12 scripts/dac_decode.py codes.bin output.wav
+    std::string codes_path = output_path + ".codes.bin";
+    FILE* f = fopen(codes_path.c_str(), "wb");
     if (!f) return false;
 
     fwrite(&n_frames, sizeof(int), 1, f);
@@ -281,42 +276,7 @@ bool decode_dac_to_wav(
             fwrite(&tok, sizeof(int32_t), 1, f);
     fclose(f);
 
-    // Write Python decoder script
-    std::string script_path = output_path + "_decode.py";
-    FILE* sf = fopen(script_path.c_str(), "w");
-    if (!sf) return false;
-    fprintf(sf,
-        "import struct, numpy as np, torch\n"
-        "with open('%s','rb') as f:\n"
-        " nf=struct.unpack('i',f.read(4))[0]\n"
-        " nc=struct.unpack('i',f.read(4))[0]\n"
-        " codes=np.frombuffer(f.read(),dtype=np.int32).reshape(nf,nc)\n"
-        "codes_t=torch.tensor(codes,dtype=torch.int64).unsqueeze(0)\n"
-        "import dac\n"
-        "m=dac.DAC.load(dac.utils.download(model_type='44khz')).eval()\n"
-        "codes_t=torch.clamp(codes_t,max=1023)\n"
-        "z=m.quantizer.from_codes(codes_t.permute(0,2,1))[0]\n"
-        "audio=m.decode(z).float().squeeze()\n"
-        "audio.detach().numpy().astype(np.float32).tofile('%s')\n"
-        "print(f'Decoded {len(audio)} samples')\n",
-        tmp.c_str(), output_path.c_str());
-    fclose(sf);
-
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "python3.12 %s", script_path.c_str());
-
-    int ret = system(cmd);
-    if (ret != 0) {
-        fprintf(stderr, "DAC decode failed (ret=%d)\n", ret);
-        return false;
-    }
-
-    // Verify output
-    struct stat st;
-    if (stat(output_path.c_str(), &st) == 0) {
-        printf("Decoded audio: %ld samples (%.1f sec)\n",
-               st.st_size / 4, (st.st_size / 4) / 44100.0);
-    }
-
+    printf("Saved %d DAC codec frames to %s\n", n_frames, codes_path.c_str());
+    printf("Decode to WAV: python3.12 scripts/dac_decode.py %s output.wav\n", codes_path.c_str());
     return true;
 }

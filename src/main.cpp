@@ -35,7 +35,7 @@ static std::vector<int32_t> tokenize_text(const std::string& text, int text_voca
 
 int main(int argc, char** argv) {
     std::string model_dir;
-    std::string output_path = "output.pcm";
+    std::string output_path = "output.codes";
     std::string text;
     std::string speaker_path;
     Zonos2GenParams params;
@@ -164,14 +164,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Decode to audio using DAC (if available)
-    printf("Decoding audio with DAC...\n");
-    if (!decode_dac_to_wav(audio_codes, output_path)) {
-        fprintf(stderr, "DAC decode failed — saving raw codes only\n");
-        fprintf(stderr, "To decode manually: python3 -c \"...\" (see README)\n");
-    } else {
-        printf("Saved audio to %s\n", output_path.c_str());
-    }
+    // Save DAC codec tokens (audio decode is external)
+    decode_dac_to_wav(audio_codes, output_path);
 
     free_zonos2_weights(weights);
     printf("Done.\n");
