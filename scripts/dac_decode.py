@@ -1,9 +1,6 @@
 #!/usr/bin/env python3.12
 """dac_decode.py — Decode Zonos2 DAC codec tokens to WAV audio.
-
-Usage: python3.12 dac_decode.py input.codes.bin output.wav
-
-Requires: descript-audio-codec (pip install descript-audio-codec)
+Applies shear_up to remove the multi-codebook delay pattern.
 """
 import struct, sys, numpy as np, torch
 
@@ -21,7 +18,18 @@ with open(input_path, 'rb') as f:
 
 print(f"Loaded {nf} frames, {nc} codebooks")
 
-codes_t = torch.tensor(codes, dtype=torch.int64).unsqueeze(0)
+# shear_up: remove delay pattern (codebook j delayed by j frames)
+PAD = 1025  # audio_pad_id
+codes_t = torch.tensor(codes, dtype=torch.int64)
+H, W = codes_t.shape
+out = codes_t.new_full((H, W), PAD)
+for j in range(W):
+    if H > j:
+        out[:H-j, j] = codes_t[j:, j]
+codes_t = out
+
+# Clamp and decode
+codes_t = codes_t.unsqueeze(0)  # [1, frames, codebooks]
 import dac
 m = dac.DAC.load(dac.utils.download(model_type='44khz')).eval()
 codes_t = torch.clamp(codes_t, max=1023)

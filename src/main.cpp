@@ -18,18 +18,16 @@
 #include <vector>
 #include <string>
 
-// Simple UTF-8 bytes tokenizer: maps each byte [0..518] to itself
-// Bytes 0-518 are mapped; 519 is reserved as text_vocab padding
-// Bytes > 518 are mapped to 518 (or a fallback)
-static std::vector<int32_t> tokenize_text(const std::string& text, int text_vocab) {
+// Simple UTF-8 byte tokenizer with legacy symbol offset
+// Zonos2 uses: token = byte + LEGACY_SYMBOL_VOCAB_SIZE (192)
+// So 'H'=72 becomes 264, and BOS=2, EOS=3 wrap the sequence
+static std::vector<int32_t> tokenize_text(const std::string& text) {
     std::vector<int32_t> tokens;
+    tokens.push_back(2);  // BOS
     for (unsigned char c : text) {
-        if (c <= text_vocab - 1) {
-            tokens.push_back((int32_t)c);
-        } else {
-            tokens.push_back(text_vocab - 1);  // fallback
-        }
+        tokens.push_back(192 + (int32_t)c);  // byte + 192
     }
+    tokens.push_back(3);  // EOS
     return tokens;
 }
 
@@ -91,31 +89,69 @@ int main(int argc, char** argv) {
     int frame_width = n_codebooks + 1;
 
     // Tokenize text
-    std::vector<int32_t> text_tokens = tokenize_text(text, cfg.text_vocab);
+    std::vector<int32_t> text_tokens = tokenize_text(text);
     printf("Text: \"%s\" -> %zu tokens\n", text.c_str(), text_tokens.size());
 
-    // Build prompt: [audio_pad, ..., audio_pad, text_token] for each text token
-    // Format: prepend a silence prefix (short pause before speech)
-    // Following Zonos2 server convention: prepend 2 frames of silence
-    int silence_frames = 2;
-    int total_prompt_frames = silence_frames + text_tokens.size();
-    std::vector<int32_t> prompt(total_prompt_frames * frame_width);
+    // Build prompt matching Python zonos2 format:
+    // [speaker_slot] [text_frames...] [silence_suffix_frames...]
+    //
+    // Speaker slot: [audio_pad*9, text_vocab]
+    // Text frame: [audio_pad*9, text_token]
+    // Silence suffix: 17 frames of pre-computed silence tokens (0.2s at 44.1kHz)
+    
+    // Pre-computed silence tokens from zonos2 prompt.py _SILENCE_TOKENS_0_2S
+    const int silence_frames = 17;
+    const int32_t silence_tokens[17][9] = {
+        {568, 778, 338, 524, 967, 360, 728, 550, 90},
+        {568, 778, 10, 674, 364, 981, 741, 378, 731},
+        {568, 804, 10, 674, 364, 981, 568, 378, 731},
+        {568, 804, 10, 674, 364, 981, 568, 378, 731},
+        {568, 804, 10, 674, 364, 981, 568, 378, 731},
+        {568, 804, 10, 674, 364, 981, 568, 378, 731},
+        {568, 804, 10, 674, 364, 981, 568, 378, 731},
+        {568, 804, 10, 674, 364, 981, 568, 378, 731},
+        {568, 804, 10, 674, 364, 981, 568, 378, 731},
+        {568, 804, 10, 674, 364, 981, 568, 378, 731},
+        {568, 804, 10, 674, 364, 981, 568, 378, 731},
+        {568, 804, 10, 674, 364, 981, 568, 378, 731},
+        {568, 804, 10, 674, 364, 981, 568, 378, 731},
+        {568, 804, 10, 674, 364, 981, 568, 378, 731},
+        {568, 804, 10, 674, 364, 981, 568, 378, 731},
+        {568, 804, 10, 674, 364, 981, 568, 378, 731},
+        {568, 778, 721, 842, 264, 974, 989, 507, 308},
+    };
 
-    // Silence frames (audio_pad_id for all codebooks, text_vocab for text)
-    for (int f = 0; f < silence_frames; f++) {
-        for (int cb = 0; cb < n_codebooks; cb++) {
-            prompt[f * frame_width + cb] = audio_pad_id;
-        }
-        prompt[f * frame_width + n_codebooks] = cfg.text_vocab;  // text padding
-    }
+    const int sheared_silence_frames = silence_frames + n_codebooks - 1;  // 17 + 9 - 1 = 25
+    int total_prompt_frames = 1 + (int)text_tokens.size() + sheared_silence_frames;
+    std::vector<int32_t> prompt(total_prompt_frames * frame_width);
+    int pf = 0;
+
+    // Speaker slot
+    for (int cb = 0; cb < n_codebooks; cb++)
+        prompt[pf * frame_width + cb] = audio_pad_id;
+    prompt[pf * frame_width + n_codebooks] = cfg.text_vocab;
+    pf++;
 
     // Text frames
     for (size_t i = 0; i < text_tokens.size(); i++) {
-        int f = silence_frames + i;
+        for (int cb = 0; cb < n_codebooks; cb++)
+            prompt[pf * frame_width + cb] = audio_pad_id;
+        prompt[pf * frame_width + n_codebooks] = text_tokens[i];
+        pf++;
+    }
+
+    // Silence suffix — apply shear pattern (codebook j delayed by j frames)
+    // Python: shear(silence[:, :n_codebooks], audio_pad_id)
+    for (int i = 0; i < sheared_silence_frames; i++) {
         for (int cb = 0; cb < n_codebooks; cb++) {
-            prompt[f * frame_width + cb] = audio_pad_id;
+            int src_frame = i - (n_codebooks - 1 - cb);
+            if (src_frame >= 0 && src_frame < silence_frames)
+                prompt[pf * frame_width + cb] = silence_tokens[src_frame][cb];
+            else
+                prompt[pf * frame_width + cb] = audio_pad_id;
         }
-        prompt[f * frame_width + n_codebooks] = text_tokens[i];
+        prompt[pf * frame_width + n_codebooks] = cfg.text_vocab;
+        pf++;
     }
 
     // Load speaker embedding (optional)

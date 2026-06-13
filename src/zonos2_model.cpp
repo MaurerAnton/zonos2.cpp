@@ -689,5 +689,12 @@ bool zonos2_forward(
         }
     }
 
+    // DEBUG: save logits
+    {
+        FILE* df = fopen("/tmp/cpp_logits.bin", "wb");
+        fwrite(logits_out, sizeof(float), n_tokens * n_codebooks * audio_vocab, df);
+        fclose(df);
+    }
+
     return true;
 }
