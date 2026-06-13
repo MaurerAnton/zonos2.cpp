@@ -140,7 +140,7 @@ static void embedding_sum(
         if (tid >= 0 && tid < cfg.text_vocab) {  // only real text, not padding
             const float* emb = w.text_embed.weight.ptr();
             const float* row = emb + tid * dim;
-            for (int d = 0; d < dim; d++) out_t[d] += row[d];
+            for (int d = 0; d < dim; d++) out_t[d] += row[d] * 5.0f;
         } else if (tid == cfg.text_vocab) {
             // Text padding — no boost
             const float* emb = w.text_embed.weight.ptr();
