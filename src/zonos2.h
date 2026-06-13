@@ -12,8 +12,12 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
 #include <string>
 #include <vector>
+
+// BF16 support
+#include "bf16_ops.h"
 
 // ============================================================
 // Model configuration (from params.json)
@@ -107,8 +111,9 @@ struct RMSNormW {
 struct LinearW {
     int in_features;
     int out_features;
-    TensorF32 weight;  // [in_features, out_features] for ggml_mul_mat
+    TensorF32 weight;  // [in_features, out_features] cleared after BF16 conversion
     TensorF32 bias;    // [out_features] or empty
+    Bf16Tensor w_bf16; // BF16 weights for fast dot product (like llama.cpp)
 };
 
 // Attention weights (per layer)

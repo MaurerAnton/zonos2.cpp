@@ -1,41 +1,27 @@
-// zonos2_model.cpp — Pure C++ Zonos2 model implementation using ggml
-// Corrected: per-token RMSNorm, QK norm, KV cache, GQA attention, EDA router
-// BF16 emulation: rounds F32 to BF16 precision to match Python's BF16 behavior
+// zonos2_model.cpp — Pure C++ Zonos2 model implementation
+// BF16 weights + AVX2 dot product (like llama.cpp)
 
 #include "zonos2.h"
+#include "bf16_ops.h"
 #include <ggml.h>
 #include <cmath>
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
 
-// ============================================================
-// BF16 emulation (matches Python's bfloat16 precision)
-// ============================================================
-static inline uint16_t f32_to_bf16(float f) {
-    uint32_t bits;
-    memcpy(&bits, &f, sizeof(float));
-    // BF16 is the upper 16 bits of F32
-    return (uint16_t)(bits >> 16);
-}
-
-static inline float bf16_to_f32(uint16_t bf) {
-    uint32_t bits = ((uint32_t)bf) << 16;
-    float result;
-    memcpy(&result, &bits, sizeof(float));
-    return result;
-}
-
-// Round float to BF16 precision (convert to BF16 and back)
-static inline float f32_round_bf16(float f) {
-    return bf16_to_f32(f32_to_bf16(f));
-}
-
-// Round array to BF16 precision in-place
-static void array_round_bf16(float* data, int n) {
+// Local BF16 rounding helpers (leverages bf16_ops.h for AVX2 dot products)
+static inline void array_round_bf16(float* data, int n) {
     for (int i = 0; i < n; i++) {
-        data[i] = f32_round_bf16(data[i]);
+        uint32_t bits; memcpy(&bits, &data[i], 4);
+        bits = (bits >> 16) << 16;
+        memcpy(&data[i], &bits, 4);
     }
+}
+static inline float f32_round_bf16(float f) {
+    uint32_t bits; memcpy(&bits, &f, 4);
+    bits = (bits >> 16) << 16;
+    memcpy(&f, &bits, 4);
+    return f;
 }
 
 static float* tensor_data(ggml_tensor* t) {
@@ -239,6 +225,26 @@ static void linear_forward(
     }
 }
 
+// BF16 linear using pre-converted weights + AVX2 bf16_dot
+static void linear_forward_bf16(
+    const LinearW& lw,
+    const float* x, int n_tokens,
+    float* output
+) {
+    const uint16_t* w = lw.w_bf16.ptr();
+    int in_f = lw.in_features, out_f = lw.out_features;
+    const float* bias = lw.bias.empty() ? nullptr : lw.bias.ptr();
+    for (int t = 0; t < n_tokens; t++) {
+        const float* xt = x + t * in_f;
+        float* ot = output + t * out_f;
+        for (int o = 0; o < out_f; o++) {
+            float s = bias ? bias[o] : 0.0f;
+            s += bf16_dot(w + o * in_f, xt, in_f);
+            ot[o] = s;
+        }
+    }
+}
+
 // ============================================================
 // Attention forward
 // ============================================================
@@ -258,11 +264,11 @@ static void attention_forward(
 
     // Q projection
     std::vector<float> q(n_heads * head_dim * n_tokens);
-    linear_forward(attn.wq.weight.ptr(), dim, dim, x, n_tokens, q.data());
+    linear_forward_bf16(attn.wq, x, n_tokens, q.data());
 
     // KV projection (fused)
     std::vector<float> kv(kv_dim * 2 * n_tokens);
-    linear_forward(attn.wkv.weight.ptr(), dim, kv_dim * 2, x, n_tokens, kv.data());
+    linear_forward_bf16(attn.wkv, x, n_tokens, kv.data());
 
     // Split K, V
     std::vector<float> k(kv_dim * n_tokens), v(kv_dim * n_tokens);
@@ -370,7 +376,7 @@ static void attention_forward(
     // Headwise gating
     {
         std::vector<float> gate(n_heads * n_tokens);
-        linear_forward(attn.gater.weight.ptr(), dim, n_heads, x, n_tokens, gate.data());
+        linear_forward_bf16(attn.gater, x, n_tokens, gate.data());
         // Sigmoid
         for (int i = 0; i < n_heads * n_tokens; i++)
             gate[i] = f32_round_bf16(1.0f / (1.0f + std::exp(-gate[i])));
@@ -394,7 +400,7 @@ static void attention_forward(
     }
 
     // Output projection
-    linear_forward(attn.wo.weight.ptr(), dim, dim, o_in.data(), n_tokens, output);
+    linear_forward_bf16(attn.wo, o_in.data(), n_tokens, output);
 }
 
 // ============================================================
@@ -410,7 +416,7 @@ static void feedforward_forward(
 
     // w_in: [ffn_dim*2, dim] -> gate (first ffn_dim rows) + up (last ffn_dim rows)
     std::vector<float> h_gate(ffn_dim * 2 * n_tokens);
-    linear_forward(ffn.w_in.weight.ptr(), dim, ffn_dim * 2, x, n_tokens, h_gate.data());
+    linear_forward_bf16(ffn.w_in, x, n_tokens, h_gate.data());
 
     // Split: h = first half (up), gate = second half
     std::vector<float> y(ffn_dim * n_tokens);
@@ -423,7 +429,7 @@ static void feedforward_forward(
     }
 
     // w_out: [dim, ffn_dim]
-    linear_forward(ffn.w_out.weight.ptr(), ffn_dim, dim, y.data(), n_tokens, output);
+    linear_forward_bf16(ffn.w_out, y.data(), n_tokens, output);
 }
 
 // ============================================================
@@ -444,8 +450,7 @@ static void router_forward(
 
     // Down project
     std::vector<float> hs(n_tokens * router_dim);
-    linear_forward(router.down_proj.weight.ptr(), dim, router_dim, x, n_tokens, hs.data(),
-                   router.down_proj.bias.empty() ? nullptr : router.down_proj.bias.ptr());
+    linear_forward_bf16(router.down_proj, x, n_tokens, hs.data());
 
     // EDA: blend with previous router states
     if (router.use_eda && router_states_in) {
@@ -468,18 +473,16 @@ static void router_forward(
 
     // Router MLP: GELU -> Linear -> GELU -> Linear
     std::vector<float> tmp1(n_tokens * router_dim);
-    linear_forward(router.mlp_0.weight.ptr(), router_dim, router_dim, hs.data(), n_tokens, tmp1.data(),
-                   router.mlp_0.bias.empty() ? nullptr : router.mlp_0.bias.ptr());
+    linear_forward_bf16(router.mlp_0, hs.data(), n_tokens, tmp1.data());
     for (int i = 0; i < n_tokens * router_dim; i++) tmp1[i] = f32_round_bf16(gelu_f32(tmp1[i]));
 
     std::vector<float> tmp2(n_tokens * router_dim);
-    linear_forward(router.mlp_2.weight.ptr(), router_dim, router_dim, tmp1.data(), n_tokens, tmp2.data(),
-                   router.mlp_2.bias.empty() ? nullptr : router.mlp_2.bias.ptr());
+    linear_forward_bf16(router.mlp_2, tmp1.data(), n_tokens, tmp2.data());
     for (int i = 0; i < n_tokens * router_dim; i++) tmp2[i] = f32_round_bf16(gelu_f32(tmp2[i]));
 
     // Final linear -> expert logits [n_experts, n_tokens]
     std::vector<float> expert_logits(n_tokens * n_experts);
-    linear_forward(router.mlp_4.weight.ptr(), router_dim, n_experts, tmp2.data(), n_tokens, expert_logits.data());
+    linear_forward_bf16(router.mlp_4, tmp2.data(), n_tokens, expert_logits.data());
 
     // Softmax over experts
     for (int t = 0; t < n_tokens; t++) {
@@ -740,7 +743,7 @@ bool zonos2_forward(
     // 5. Multi-output head
     int out_dim = audio_vocab * n_codebooks;
     std::vector<float> logits_flat(n_tokens * out_dim);
-    linear_forward(w.multi_output.weight.ptr(), dim, out_dim, x.data(), n_tokens, logits_flat.data());
+    linear_forward_bf16(w.multi_output, x.data(), n_tokens, logits_flat.data());
 
     // Softcap and reshape to [n_tokens, n_codebooks, audio_vocab]
     for (int t = 0; t < n_tokens; t++) {
