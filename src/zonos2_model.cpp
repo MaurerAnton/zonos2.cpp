@@ -572,9 +572,10 @@ static void transformer_block_forward(
     int dim = cfg.dim;
 
     // attention_norm: per-token RMSNorm with fused residual
+    // Residual = ORIGINAL x (before normalization)
+    memcpy(residual, x, n_tokens * dim * sizeof(float));
     rms_norm_per_token(x, dim, n_tokens, cfg.norm_eps,
                        layer.attention_norm.has_weight ? layer.attention_norm.weight.ptr() : nullptr);
-    memcpy(residual, x, n_tokens * dim * sizeof(float));
 
     // Attention
     std::vector<float> attn_out(dim * n_tokens);
@@ -586,9 +587,10 @@ static void transformer_block_forward(
         x[i] = attn_out.data()[i] + residual[i];
 
     // ffn_norm with fused residual
+    // Residual = ORIGINAL x (before normalization)
+    memcpy(residual, x, n_tokens * dim * sizeof(float));
     rms_norm_per_token(x, dim, n_tokens, cfg.norm_eps,
                        layer.ffn_norm.has_weight ? layer.ffn_norm.weight.ptr() : nullptr);
-    memcpy(residual, x, n_tokens * dim * sizeof(float));
 
     // FeedForward
     std::vector<float> ffn_out(dim * n_tokens);
