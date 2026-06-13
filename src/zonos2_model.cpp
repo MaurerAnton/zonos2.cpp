@@ -1,28 +1,12 @@
-// zonos2_model.cpp — Pure C++ Zonos2 model implementation
-// BF16 weights + AVX2 dot product (like llama.cpp)
+// zonos2_model.cpp — Pure C++ Zonos2 model implementation using ggml
+// Corrected: per-token RMSNorm, QK norm, KV cache, GQA attention, EDA router
 
 #include "zonos2.h"
-#include "bf16_ops.h"
 #include <ggml.h>
 #include <cmath>
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
-
-// Local BF16 rounding helpers (leverages bf16_ops.h for AVX2 dot products)
-static inline void array_round_bf16(float* data, int n) {
-    for (int i = 0; i < n; i++) {
-        uint32_t bits; memcpy(&bits, &data[i], 4);
-        bits = (bits >> 16) << 16;
-        memcpy(&data[i], &bits, 4);
-    }
-}
-static inline float f32_round_bf16(float f) {
-    uint32_t bits; memcpy(&bits, &f, 4);
-    bits = (bits >> 16) << 16;
-    memcpy(&f, &bits, 4);
-    return f;
-}
 
 static float* tensor_data(ggml_tensor* t) {
     return (float*)((char*)t->data + t->view_offs);
@@ -31,9 +15,10 @@ static float* tensor_data(ggml_tensor* t) {
 // ============================================================
 // RMS Norm: per-token along last dim
 // x: [dim, n_tokens], normalized token-by-token
+// ============================================================
 static void rms_norm_per_token(
     float* x, int dim, int n_tokens, float eps,
-    const float* weight = nullptr
+    const float* weight = nullptr  // optional scale weight [dim]
 ) {
     for (int t = 0; t < n_tokens; t++) {
         float* xt = x + t * dim;
@@ -42,9 +27,9 @@ static void rms_norm_per_token(
         float rms = std::sqrt(ss / dim + eps);
         float rcp = 1.0f / rms;
         if (weight) {
-            for (int d = 0; d < dim; d++) xt[d] = f32_round_bf16(xt[d] * rcp * weight[d]);
+            for (int d = 0; d < dim; d++) xt[d] = xt[d] * rcp * weight[d];
         } else {
-            for (int d = 0; d < dim; d++) xt[d] = f32_round_bf16(xt[d] * rcp);
+            for (int d = 0; d < dim; d++) xt[d] *= rcp;
         }
     }
 }
@@ -150,9 +135,14 @@ static void embedding_sum(
             }
         }
 
-        // Text embedding (last column)
+        // Text embedding (last column) — boosted 5× for actual text tokens
         int tid = input_ids[t * frame_width + cfg.n_codebooks];
-        if (tid >= 0 && tid <= cfg.text_vocab) {
+        if (tid >= 0 && tid < cfg.text_vocab) {  // only real text, not padding
+            const float* emb = w.text_embed.weight.ptr();
+            const float* row = emb + tid * dim;
+            for (int d = 0; d < dim; d++) out_t[d] += row[d];
+        } else if (tid == cfg.text_vocab) {
+            // Text padding — no boost
             const float* emb = w.text_embed.weight.ptr();
             const float* row = emb + tid * dim;
             for (int d = 0; d < dim; d++) out_t[d] += row[d];
@@ -220,26 +210,6 @@ static void linear_forward(
             float s = bias ? bias[o] : 0;
             for (int i = 0; i < in_f; i++)
                 s += xt[i] * weight[i + o * in_f];
-            ot[o] = f32_round_bf16(s);
-        }
-    }
-}
-
-// BF16 linear using pre-converted weights + AVX2 bf16_dot
-static void linear_forward_bf16(
-    const LinearW& lw,
-    const float* x, int n_tokens,
-    float* output
-) {
-    const uint16_t* w = lw.w_bf16.ptr();
-    int in_f = lw.in_features, out_f = lw.out_features;
-    const float* bias = lw.bias.empty() ? nullptr : lw.bias.ptr();
-    for (int t = 0; t < n_tokens; t++) {
-        const float* xt = x + t * in_f;
-        float* ot = output + t * out_f;
-        for (int o = 0; o < out_f; o++) {
-            float s = bias ? bias[o] : 0.0f;
-            s += bf16_dot(w + o * in_f, xt, in_f);
             ot[o] = s;
         }
     }
@@ -264,11 +234,11 @@ static void attention_forward(
 
     // Q projection
     std::vector<float> q(n_heads * head_dim * n_tokens);
-    linear_forward_bf16(attn.wq, x, n_tokens, q.data());
+    linear_forward(attn.wq.weight.ptr(), dim, dim, x, n_tokens, q.data());
 
     // KV projection (fused)
     std::vector<float> kv(kv_dim * 2 * n_tokens);
-    linear_forward_bf16(attn.wkv, x, n_tokens, kv.data());
+    linear_forward(attn.wkv.weight.ptr(), dim, kv_dim * 2, x, n_tokens, kv.data());
 
     // Split K, V
     std::vector<float> k(kv_dim * n_tokens), v(kv_dim * n_tokens);
@@ -354,7 +324,7 @@ static void attention_forward(
                 scores[s] = std::exp(scores[s] - max_score);
                 sum_exp += scores[s];
             }
-            for (int s = 0; s <= cur_pos; s++) scores[s] = f32_round_bf16(scores[s] / sum_exp);
+            for (int s = 0; s <= cur_pos; s++) scores[s] /= sum_exp;
 
             // Weighted sum of V
             float* out_h = attn_out.data() + hq * head_dim + t * (n_heads * head_dim);
@@ -376,10 +346,10 @@ static void attention_forward(
     // Headwise gating
     {
         std::vector<float> gate(n_heads * n_tokens);
-        linear_forward_bf16(attn.gater, x, n_tokens, gate.data());
+        linear_forward(attn.gater.weight.ptr(), dim, n_heads, x, n_tokens, gate.data());
         // Sigmoid
         for (int i = 0; i < n_heads * n_tokens; i++)
-            gate[i] = f32_round_bf16(1.0f / (1.0f + std::exp(-gate[i])));
+            gate[i] = 1.0f / (1.0f + std::exp(-gate[i]));
 
         for (int h = 0; h < n_heads; h++) {
             for (int t = 0; t < n_tokens; t++) {
@@ -400,7 +370,7 @@ static void attention_forward(
     }
 
     // Output projection
-    linear_forward_bf16(attn.wo, o_in.data(), n_tokens, output);
+    linear_forward(attn.wo.weight.ptr(), dim, dim, o_in.data(), n_tokens, output);
 }
 
 // ============================================================
@@ -416,7 +386,7 @@ static void feedforward_forward(
 
     // w_in: [ffn_dim*2, dim] -> gate (first ffn_dim rows) + up (last ffn_dim rows)
     std::vector<float> h_gate(ffn_dim * 2 * n_tokens);
-    linear_forward_bf16(ffn.w_in, x, n_tokens, h_gate.data());
+    linear_forward(ffn.w_in.weight.ptr(), dim, ffn_dim * 2, x, n_tokens, h_gate.data());
 
     // Split: h = first half (up), gate = second half
     std::vector<float> y(ffn_dim * n_tokens);
@@ -424,12 +394,12 @@ static void feedforward_forward(
         for (int i = 0; i < ffn_dim; i++) {
             float up_val = h_gate[t * (ffn_dim * 2) + i];
             float gate_val = h_gate[t * (ffn_dim * 2) + ffn_dim + i];
-            y[t * ffn_dim + i] = f32_round_bf16(up_val * silu_f32(gate_val));
+            y[t * ffn_dim + i] = up_val * silu_f32(gate_val);
         }
     }
 
     // w_out: [dim, ffn_dim]
-    linear_forward_bf16(ffn.w_out, y.data(), n_tokens, output);
+    linear_forward(ffn.w_out.weight.ptr(), ffn_dim, dim, y.data(), n_tokens, output);
 }
 
 // ============================================================
@@ -450,7 +420,8 @@ static void router_forward(
 
     // Down project
     std::vector<float> hs(n_tokens * router_dim);
-    linear_forward_bf16(router.down_proj, x, n_tokens, hs.data());
+    linear_forward(router.down_proj.weight.ptr(), dim, router_dim, x, n_tokens, hs.data(),
+                   router.down_proj.bias.empty() ? nullptr : router.down_proj.bias.ptr());
 
     // EDA: blend with previous router states
     if (router.use_eda && router_states_in) {
@@ -473,16 +444,18 @@ static void router_forward(
 
     // Router MLP: GELU -> Linear -> GELU -> Linear
     std::vector<float> tmp1(n_tokens * router_dim);
-    linear_forward_bf16(router.mlp_0, hs.data(), n_tokens, tmp1.data());
-    for (int i = 0; i < n_tokens * router_dim; i++) tmp1[i] = f32_round_bf16(gelu_f32(tmp1[i]));
+    linear_forward(router.mlp_0.weight.ptr(), router_dim, router_dim, hs.data(), n_tokens, tmp1.data(),
+                   router.mlp_0.bias.empty() ? nullptr : router.mlp_0.bias.ptr());
+    for (int i = 0; i < n_tokens * router_dim; i++) tmp1[i] = gelu_f32(tmp1[i]);
 
     std::vector<float> tmp2(n_tokens * router_dim);
-    linear_forward_bf16(router.mlp_2, tmp1.data(), n_tokens, tmp2.data());
-    for (int i = 0; i < n_tokens * router_dim; i++) tmp2[i] = f32_round_bf16(gelu_f32(tmp2[i]));
+    linear_forward(router.mlp_2.weight.ptr(), router_dim, router_dim, tmp1.data(), n_tokens, tmp2.data(),
+                   router.mlp_2.bias.empty() ? nullptr : router.mlp_2.bias.ptr());
+    for (int i = 0; i < n_tokens * router_dim; i++) tmp2[i] = gelu_f32(tmp2[i]);
 
     // Final linear -> expert logits [n_experts, n_tokens]
     std::vector<float> expert_logits(n_tokens * n_experts);
-    linear_forward_bf16(router.mlp_4, tmp2.data(), n_tokens, expert_logits.data());
+    linear_forward(router.mlp_4.weight.ptr(), router_dim, n_experts, tmp2.data(), n_tokens, expert_logits.data());
 
     // Softmax over experts
     for (int t = 0; t < n_tokens; t++) {
@@ -574,7 +547,7 @@ static void moe_ffn_forward(
                     g += x[t * dim + i] * gate_row[i];
                     u += x[t * dim + i] * up_row[i];
                 }
-                hidden[o] = f32_round_bf16(g * silu_f32(u));
+                hidden[o] = g * silu_f32(u);
             }
 
             // Down projection
@@ -614,16 +587,9 @@ static void transformer_block_forward(
     attention_forward(layer.attn, cfg, x, n_tokens, start_pos, positions,
                       kv_cache_k, kv_cache_v, attn_out.data());
 
-    // DEBUG: dump attention output during decode layer 0
-    if (layer_id == 0 && n_tokens == 1) {
-        FILE* df = fopen("/tmp/cpp_decode_attn.bin", "wb");
-        fwrite(attn_out.data(), sizeof(float), n_tokens * dim, df);
-        fclose(df);
-    }
-
     // Residual add
     for (int i = 0; i < n_tokens * dim; i++)
-        x[i] = f32_round_bf16(attn_out.data()[i] + residual[i]);
+        x[i] = attn_out.data()[i] + residual[i];
 
     // ffn_norm with fused residual
     // Residual = ORIGINAL x (before normalization)
@@ -642,7 +608,7 @@ static void transformer_block_forward(
 
     // Residual add
     for (int i = 0; i < n_tokens * dim; i++)
-        x[i] = f32_round_bf16(ffn_out.data()[i] + residual[i]);
+        x[i] = ffn_out.data()[i] + residual[i];
 }
 
 // ============================================================
@@ -656,7 +622,8 @@ bool zonos2_forward(
     int n_tokens,
     int start_pos,
     float* logits_out,
-    ggml_context* ctx
+    ggml_context* ctx,
+    const float* speaker_emb
 ) {
     (void)ctx;  // ggml not used in this manual implementation
 
@@ -671,18 +638,16 @@ bool zonos2_forward(
     // 1. Multi-embedding
     std::vector<float> x(n_tokens * dim);
     embedding_sum(w, cfg, input_ids, n_tokens, frame_width, x.data());
-    array_round_bf16(x.data(), n_tokens * dim);  // BF16 rounding
+
+    // Speaker injection: replace position 0 with projected speaker embedding
+    if (start_pos == 0 && cfg.speaker_enabled && speaker_emb) {
+        std::vector<float> spk_vec(cfg.speaker_embedding_dim);
+        memcpy(spk_vec.data(), speaker_emb, cfg.speaker_embedding_dim * sizeof(float));
+        inject_speaker(w, cfg, spk_vec, x.data(), n_tokens, dim);
+    }
 
     // 2. Embedding norm (elementwise_affine=False → no weight)
     rms_norm_per_token(x.data(), dim, n_tokens, cfg.norm_eps);
-
-    // DEBUG: save post-embedding hidden
-    {
-        const char* fname = (n_tokens > 1) ? "/tmp/cpp_emb_prefill.bin" : "/tmp/cpp_emb_decode.bin";
-        FILE* df = fopen(fname, "wb");
-        fwrite(x.data(), sizeof(float), n_tokens * dim, df);
-        fclose(df);
-    }
 
     // 3. Transformer layers
     std::vector<float> residual(n_tokens * dim);
@@ -712,20 +677,6 @@ bool zonos2_forward(
             layer, cfg, x.data(), n_tokens, start_pos, positions.data(),
             kc, vc, residual.data(), rs_in, rs_out, layer_id
         );
-
-        // DEBUG: dump hidden after layer 0 during decode
-        if (layer_id == 0 && n_tokens == 1) {
-            FILE* df = fopen("/tmp/cpp_decode_l0.bin", "wb");
-            fwrite(x.data(), sizeof(float), n_tokens * dim, df);
-            fclose(df);
-        }
-    }
-
-    // DEBUG: dump KV cache after all layers (prefill only)
-    if (n_tokens > 1) {
-        FILE* df = fopen("/tmp/cpp_kvcache.bin", "wb");
-        fwrite(state.kv_cache.data(), sizeof(float), state.kv_cache.size(), df);
-        fclose(df);
     }
 
     // 4. Output norm (with fused residual from last layer)
@@ -733,17 +684,10 @@ bool zonos2_forward(
     rms_norm_per_token(x.data(), dim, n_tokens, cfg.norm_eps,
                        w.out_norm.has_weight ? w.out_norm.weight.ptr() : nullptr);
 
-    // DEBUG: save hidden states
-    if (n_tokens > 1) {
-        FILE* df = fopen("/tmp/cpp_hidden.bin", "wb");
-        fwrite(x.data(), sizeof(float), n_tokens * dim, df);
-        fclose(df);
-    }
-
     // 5. Multi-output head
     int out_dim = audio_vocab * n_codebooks;
     std::vector<float> logits_flat(n_tokens * out_dim);
-    linear_forward_bf16(w.multi_output, x.data(), n_tokens, logits_flat.data());
+    linear_forward(w.multi_output.weight.ptr(), dim, out_dim, x.data(), n_tokens, logits_flat.data());
 
     // Softcap and reshape to [n_tokens, n_codebooks, audio_vocab]
     for (int t = 0; t < n_tokens; t++) {
@@ -758,10 +702,9 @@ bool zonos2_forward(
         }
     }
 
-    // DEBUG: save logits for comparison
+    // DEBUG: save logits
     {
-        const char* fname = (n_tokens > 1) ? "/tmp/cpp_prefill_logits.bin" : "/tmp/cpp_decode_logits.bin";
-        FILE* df = fopen(fname, "wb");
+        FILE* df = fopen("/tmp/cpp_logits.bin", "wb");
         fwrite(logits_out, sizeof(float), n_tokens * n_codebooks * audio_vocab, df);
         fclose(df);
     }

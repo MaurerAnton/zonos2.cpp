@@ -53,6 +53,8 @@ int main(int argc, char** argv) {
             params.top_k = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--max-tokens") == 0 && i + 1 < argc) {
             params.max_tokens = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--cfg") == 0 && i + 1 < argc) {
+            params.cfg_scale = atof(argv[++i]);
         } else if (strcmp(argv[i], "--speaker") == 0 && i + 1 < argc) {
             speaker_path = argv[++i];
         } else if (argv[i][0] != '-') {
@@ -121,7 +123,8 @@ int main(int argc, char** argv) {
         {568, 778, 721, 842, 264, 974, 989, 507, 308},
     };
 
-    int total_prompt_frames = 1 + (int)text_tokens.size() + silence_frames;
+    const int sheared_silence_frames = silence_frames + n_codebooks - 1;  // 17 + 9 - 1 = 25
+    int total_prompt_frames = 1 + (int)text_tokens.size() + sheared_silence_frames;
     std::vector<int32_t> prompt(total_prompt_frames * frame_width);
     int pf = 0;
 
@@ -139,14 +142,13 @@ int main(int argc, char** argv) {
         pf++;
     }
 
-    // Silenced suffix: apply shear (17 frames input → 17 frames output)
-    // Python: shear(silence_tensor, audio_pad_id) → [17, 9]
-    for (int i = 0; i < silence_frames; i++) {
+    // Silence suffix — apply shear pattern (codebook j delayed by j frames)
+    // Python: shear(silence[:, :n_codebooks], audio_pad_id)
+    for (int i = 0; i < sheared_silence_frames; i++) {
         for (int cb = 0; cb < n_codebooks; cb++) {
-            // shear: result[t][c] = SIL[t-c][c] if t-c >= 0, else pad
-            int src = i - cb;
-            if (src >= 0 && src < silence_frames)
-                prompt[pf * frame_width + cb] = silence_tokens[src][cb];
+            int src_frame = i - (n_codebooks - 1 - cb);
+            if (src_frame >= 0 && src_frame < silence_frames)
+                prompt[pf * frame_width + cb] = silence_tokens[src_frame][cb];
             else
                 prompt[pf * frame_width + cb] = audio_pad_id;
         }

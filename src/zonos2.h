@@ -12,12 +12,8 @@
 
 #include <cstdint>
 #include <cstddef>
-#include <cstring>
 #include <string>
 #include <vector>
-
-// BF16 support
-#include "bf16_ops.h"
 
 // ============================================================
 // Model configuration (from params.json)
@@ -111,9 +107,8 @@ struct RMSNormW {
 struct LinearW {
     int in_features;
     int out_features;
-    TensorF32 weight;  // [in_features, out_features] cleared after BF16 conversion
+    TensorF32 weight;  // [in_features, out_features] for ggml_mul_mat
     TensorF32 bias;    // [out_features] or empty
-    Bf16Tensor w_bf16; // BF16 weights for fast dot product (like llama.cpp)
 };
 
 // Attention weights (per layer)
@@ -241,7 +236,8 @@ bool zonos2_forward(
     int n_tokens,                 // number of token positions to process
     int start_pos,                // position in KV cache to start
     float* logits_out,            // [n_tokens, n_codebooks, audio_vocab]
-    ggml_context* ctx
+    ggml_context* ctx,
+    const float* speaker_emb = nullptr  // optional speaker embedding [speaker_embedding_dim]
 );
 
 // Generation
@@ -252,8 +248,9 @@ struct Zonos2GenParams {
     float top_p = 0.9f;
     int top_k = 50;
     float min_p = 0.02f;
-    float repetition_penalty = 1.1f;
+    float repetition_penalty = 1.2f;
     int repetition_window = 50;
+    float cfg_scale = 1.0f;     // CFG: 1.0=off, 1.5-3.0 recommended
 };
 
 bool zonos2_generate(

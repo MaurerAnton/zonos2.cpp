@@ -48,12 +48,6 @@ static bool load_linear(const std::string& ldir, const std::string& name,
     if (!load_tensor(ldir + "/" + name + ".bin", w.weight, in_f, out_f)) return false;
     w.in_features = in_f;
     w.out_features = out_f;
-    // Convert to BF16 and free F32 weights (like llama.cpp)
-    w.w_bf16.from_f32(w.weight.ptr(), in_f * out_f);
-    w.w_bf16.ne[0] = in_f;
-    w.w_bf16.ne[1] = out_f;
-    w.weight.data.clear();  // free F32 memory
-    w.weight.data.shrink_to_fit();
     if (has_bias) {
         std::string bp = ldir + "/" + name + "_b.bin";
         if (file_exists(bp)) {

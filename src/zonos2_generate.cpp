@@ -137,17 +137,51 @@ bool zonos2_generate(
     state.seq_len = prompt_len;
 
     // ============================================================
-    // PREFILL: run forward on all prompt tokens
+    // PREFILL: conditional (with text) and unconditional (null text) for CFG
     // ============================================================
     printf("Prefilling %d prompt tokens...\n", prompt_len);
     std::vector<float> prefill_logits(prompt_len * n_codebooks * audio_vocab);
     {
+        std::vector<float> spk_emb;
+        if (!speaker_emb.empty()) spk_emb = speaker_emb;
+        else { spk_emb.resize(cfg.speaker_embedding_dim);
+               Xoshiro256 spk_rng(params.seed+999);
+               for (int i=0;i<cfg.speaker_embedding_dim;i++) spk_emb[i]=spk_rng.randf()*2.0f-1.0f; }
+
+        // Conditional forward (with text)
         if (!zonos2_forward(w, state, state.token_buffer.data(),
-                           prompt_len, 0, prefill_logits.data(), nullptr)) {
-            fprintf(stderr, "Prefill failed\n");
-            return false;
-        }
+                           prompt_len, 0, prefill_logits.data(), nullptr,
+                           spk_emb.data())) { fprintf(stderr,"Prefill failed\n"); return false; }
         state.cached_len = prompt_len;
+
+        // CFG: unconditional forward with null text
+        if (params.cfg_scale > 1.001f) {
+            printf("  CFG scale=%.1f — running unconditional prefill...\n", params.cfg_scale);
+            // Build null prompt: replace text tokens with text_vocab
+            std::vector<int32_t> null_prompt(prompt_ids.size());
+            memcpy(null_prompt.data(), prompt_ids.data(), prompt_ids.size()*sizeof(int32_t));
+            for (int t = 0; t < prompt_len; t++)
+                null_prompt[t * frame_width + n_codebooks] = cfg.text_vocab;
+
+            // Second state for unconditional path
+            Zonos2State uncond_state;
+            uncond_state.kv_cache.resize(cfg.n_layers * 2 * kv_dim * max_seqlen, 0.0f);
+            uncond_state.router_states_buf.resize(num_moe_layers * max_seqlen * cfg.moe_router_dim, 0.0f);
+            uncond_state.num_moe_layers = num_moe_layers;
+
+            std::vector<float> uncond_logits(prompt_len * n_codebooks * audio_vocab);
+            if (!zonos2_forward(w, uncond_state, null_prompt.data(),
+                               prompt_len, 0, uncond_logits.data(), nullptr,
+                               spk_emb.data())) { fprintf(stderr,"Uncond prefill failed\n"); return false; }
+            uncond_state.cached_len = prompt_len;
+
+            // Blend logits: uncond + cfg * (cond - uncond)
+            float* cond = prefill_logits.data();
+            float* uncond = uncond_logits.data();
+            float scale = params.cfg_scale;
+            for (size_t i = 0; i < prefill_logits.size(); i++)
+                cond[i] = uncond[i] + scale * (cond[i] - uncond[i]);
+        }
     }
 
     // NOTE: Speaker injection happens at the embedding step.
