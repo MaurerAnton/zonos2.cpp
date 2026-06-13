@@ -1,0 +1,9 @@
+build/
+weights/
+model_cache/
+*.so
+*.o
+*.pcm
+*.wav
+*.codes.bin
+repo/
