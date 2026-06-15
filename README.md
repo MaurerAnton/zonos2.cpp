@@ -1,6 +1,6 @@
 # zonos2.cpp — Pure C++ Zonos2 TTS
 
-100% C++20 implementation of [Zyphra/ZONOS2](https://huggingface.co/Zyphra/ZONOS2).
+nearly 100% C++20 implementation of [Zyphra/ZONOS2](https://huggingface.co/Zyphra/ZONOS2).
 
 28-layer autoregressive transformer with Mixture of Experts for text-to-speech.
 No Python runtime dependency — generates DAC codec tokens directly.
